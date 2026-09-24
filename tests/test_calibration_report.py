@@ -15,7 +15,8 @@ SQLite 文件库 + 模拟时钟，覆盖：
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
+from fractions import Fraction
 
 _tmpdir = tempfile.mkdtemp(prefix="sealed_predictions_calibration_test_")
 os.environ["DATABASE_URL"] = f"sqlite:///{_tmpdir}/calibration.db"
@@ -369,6 +370,122 @@ def test_half_even_rounding():
     assert f"{calibration.quantize6(Decimal('0.1234575')):f}" == "0.123458"  # 8 为偶
 
 
+# --------------------------------------------------------------------------- #
+# 高精度概率：单条平方误差、跨事件均分与分箱均值在最终 6 位量化前
+# 不得被默认 Decimal 上下文的 28 位有效数字提前舍入
+# --------------------------------------------------------------------------- #
+
+# 50 位小数的高精度揭示原文
+HP1 = "0.50000049999975000024999968750043749934375103124833"
+HP2 = "0.50000099999900000000000000000000000000000000000002"
+HP3 = "0.50000050000000000000000000000000000000000000000001"
+HP4 = "0.50000050000000000000000000000000000000000000000002"
+
+
+def _exact_quantize6(value: Fraction) -> str:
+    """对非负有理数做 6 位小数五成双量化（纯整数运算，与 Decimal 上下文无关）。"""
+    scaled = value * 10**6
+    q, r = divmod(scaled.numerator, scaled.denominator)
+    twice = 2 * r
+    if twice > scaled.denominator or (twice == scaled.denominator and q % 2 == 1):
+        q += 1
+    return f"{q // 10**6}.{q % 10**6:06d}"
+
+
+def _frac_prob(text: str) -> Fraction:
+    """把概率原文转为精确有理数（Fraction 不接受 ``.25`` 这类开头为点的形式，
+    先经 Decimal 精确解析）。"""
+    return Fraction(Decimal(text))
+
+
+def _exact_squared_error(text: str, outcome: int) -> Decimal:
+    """在足够精度的局部上下文中计算 (p-y)^2，作为被测实现的独立参照。"""
+    with localcontext() as ctx:
+        ctx.prec = 200
+        return (Decimal(text) - Decimal(outcome)) ** 2
+
+
+def test_high_precision_squared_error_not_pre_rounded():
+    # 回归：(HP1-0)^2 = 0.2500005000000000000000000000000000000000000000000057784…
+    # 精确值严格大于五成双分界 0.2500005，6 位量化应为 0.250001；
+    # 默认 28 位上下文把平方误差提前舍入成恰好 0.2500005，五成双误为 0.250000。
+    event_id = settled_event([(HP1, "hp-se")], "0")
+    body = report([event_id])
+    assert body["valid_prediction_count"] == 1
+    assert body["predictions"][0]["squared_error"] == "0.250001"
+    # 单条预测时 Brier 均分退化为该平方误差
+    assert body["brier_mean"] == "0.250001"
+    assert f"{calibration.quantize6(_exact_squared_error(HP1, 0)):f}" == "0.250001"
+    # 概率本身（分箱均值）不受影响：HP1 = 0.5000004999… 量化为 0.500000
+    bin5 = body["bins"][5]
+    assert bin5["count"] == 1
+    assert bin5["mean"] == _exact_quantize6(_frac_prob(HP1)) == "0.500000"
+    assert bin5["positive_rate"] == "0.000000"
+
+
+def test_high_precision_brier_mean_across_events_order_independent():
+    # 两个事件各一条高精度预测：Brier 均分 = (HP1^2 + HP2^2) / 2，
+    # 结果与精确十进制计算一致，且与请求中的事件顺序无关。
+    a = settled_event([(HP1, "hp-a")], "0")
+    b = settled_event([(HP2, "hp-b")], "0")
+    expected_se = {
+        HP1: _exact_quantize6(_frac_prob(HP1) ** 2),
+        HP2: _exact_quantize6(_frac_prob(HP2) ** 2),
+    }
+    expected_brier = _exact_quantize6(
+        (_frac_prob(HP1) ** 2 + _frac_prob(HP2) ** 2) / 2
+    )
+    expected_bin_mean = _exact_quantize6(
+        (_frac_prob(HP1) + _frac_prob(HP2)) / 2
+    )
+    assert expected_se[HP1] == "0.250001"
+    assert expected_brier == "0.250001"
+
+    forward = report([a, b])
+    backward = report([b, a])
+    for body in (forward, backward):
+        assert body["valid_prediction_count"] == 2
+        assert body["brier_mean"] == expected_brier
+        bin5 = body["bins"][5]
+        assert bin5["count"] == 2
+        assert bin5["mean"] == expected_bin_mean
+        assert bin5["positive_rate"] == "0.000000"
+        se = {p["original_text"]: p["squared_error"] for p in body["predictions"]}
+        assert se == expected_se
+    # 分箱汇总不随输入顺序改变
+    assert forward["bins"] == backward["bins"]
+    # 逐条计分不随输入顺序改变（条目分组顺序由事件 ID 决定）
+    se_forward = {p["original_text"]: p["squared_error"] for p in forward["predictions"]}
+    se_backward = {p["original_text"]: p["squared_error"]
+                   for p in backward["predictions"]}
+    assert se_forward == se_backward
+
+
+def test_high_precision_brier_mean_of_two_identical_predictions():
+    # 两条相同的高精度预测：均分仍为 HP1^2，默认 28 位精度会在求和/均分后
+    # 塌缩成 0.2500005 而误报 0.250000。
+    a = settled_event([(HP1, "hp-dup-a")], "0")
+    b = settled_event([(HP1, "hp-dup-b")], "0")
+    body = report([a, b])
+    assert body["valid_prediction_count"] == 2
+    assert body["brier_mean"] == "0.250001"
+    assert [p["squared_error"] for p in body["predictions"]] == [
+        "0.250001", "0.250001",
+    ]
+
+
+def test_high_precision_bin_mean_not_pre_rounded():
+    # 箱内均值 (HP3+HP4)/2 = 0.5000005000000000000000000000000000000000000000000015
+    # 严格大于五成双分界 0.5000005；默认 28 位精度会把和提前舍入到恰好
+    # 1.000001000000000000000000000，均值落在分界上而误为 0.500000。
+    event_id = settled_event([(HP3, "hp3"), (HP4, "hp4")], "1")
+    body = report([event_id])
+    bin5 = body["bins"][5]
+    assert bin5["count"] == 2
+    assert bin5["mean"] == "0.500001"
+    assert bin5["positive_rate"] == "1.000000"
+
+
 def test_probability_format_variants():
     event_id = settled_event([
         ("0", "v0"), ("1", "v1"), ("0.0", "v00"), ("1.00", "v100"),
@@ -527,6 +644,87 @@ def test_build_report_pure_decimal_exact():
     assert [p.commitment_id for p in result.predictions] == [
         _uuid(101), _uuid(102), _uuid(201)
     ]
+
+
+def test_build_report_high_precision_squared_error_exact_pure():
+    # 50 位小数概率的平方误差有 100 位小数，必须逐位保留（默认上下文 28 位
+    # 会提前舍入），且单条预测的 Brier 均分等于平方误差本身。
+    source = calibration.CalibrationSource(
+        event_id=_uuid(1), commitment_id=_uuid(11),
+        committed_at=T0, original_text=HP1, outcome=0,
+    )
+    result = calibration.build_calibration_report([source], 0)
+    with localcontext() as ctx:
+        ctx.prec = 200
+        expected_se = Decimal(HP1) ** 2
+    assert result.predictions[0].squared_error == expected_se
+    assert result.brier_mean == expected_se
+    # 最终量化为 0.250001（精确值严格大于 0.2500005）
+    assert f"{calibration.quantize6(expected_se):f}" == "0.250001"
+    # 分箱均值即概率本身（同一箱单样本）
+    assert result.bins[5].mean == Decimal(HP1)
+    assert result.bins[5].count == 1
+
+
+def test_build_report_order_independent_pure():
+    # 多个高精度预测时，打乱输入顺序不改变任何汇总结果
+    sources = [
+        calibration.CalibrationSource(
+            event_id=_uuid(2), commitment_id=_uuid(202),
+            committed_at=T0, original_text=HP2, outcome=0,
+        ),
+        calibration.CalibrationSource(
+            event_id=_uuid(1), commitment_id=_uuid(101),
+            committed_at=T0, original_text=HP1, outcome=0,
+        ),
+        calibration.CalibrationSource(
+            event_id=_uuid(1), commitment_id=_uuid(102),
+            committed_at=T0, original_text=HP3, outcome=1,
+        ),
+        calibration.CalibrationSource(
+            event_id=_uuid(2), commitment_id=_uuid(201),
+            committed_at=T0, original_text=HP4, outcome=1,
+        ),
+    ]
+    forward = calibration.build_calibration_report(sources, unrevealed_count=2)
+    backward = calibration.build_calibration_report(list(reversed(sources)), 2)
+    assert forward == backward
+
+    # 与精确十进制计算一致（独立有理数参照）
+    with localcontext() as ctx:
+        ctx.prec = 200
+        expected_brier = (
+            Decimal(HP1) ** 2 + Decimal(HP2) ** 2
+            + (Decimal(HP3) - 1) ** 2 + (Decimal(HP4) - 1) ** 2
+        ) / 4
+    assert f"{calibration.quantize6(forward.brier_mean):f}" == \
+        _exact_quantize6(
+            (
+                _frac_prob(HP1) ** 2 + _frac_prob(HP2) ** 2
+                + (_frac_prob(HP3) - 1) ** 2 + (_frac_prob(HP4) - 1) ** 2
+            ) / 4
+        )
+    assert forward.brier_mean == expected_brier
+    # HP1、HP3、HP4 都在第 5 箱，HP2 也在第 5 箱（均 >= 0.5 且 < 0.6）
+    assert forward.bins[5].count == 4
+    assert f"{calibration.quantize6(forward.bins[5].mean):f}" == \
+        _exact_quantize6(
+            (_frac_prob(HP1) + _frac_prob(HP2) + _frac_prob(HP3) + _frac_prob(HP4)) / 4
+        )
+    assert f"{calibration.quantize6(forward.bins[5].positive_rate):f}" == "0.500000"
+
+
+def test_build_report_leaves_global_decimal_context_untouched():
+    from decimal import getcontext
+
+    before = getcontext().prec
+    source = calibration.CalibrationSource(
+        event_id=_uuid(1), commitment_id=_uuid(11),
+        committed_at=T0, original_text=HP1, outcome=0,
+    )
+    result = calibration.build_calibration_report([source], 0)
+    calibration.quantize6(result.predictions[0].squared_error)
+    assert getcontext().prec == before == 28
 
 
 def _uuid(suffix: int):

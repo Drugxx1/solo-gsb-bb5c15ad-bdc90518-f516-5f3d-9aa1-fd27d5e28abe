@@ -12,14 +12,23 @@
 落在闭区间 [0, 1]。``"0"``、``"1"``、``"0.5"``、``".25"``、``"1.00"``
 合法；``"+0.5"``、``"1e-1"``、``" 0.5"``、``"1.00001"``、``"-0"`` 非法。
 
-校准指标（Brier 均分与分箱）全程使用 ``decimal.Decimal`` 精确计算，不经过
-浮点；对外数值统一四舍六入五成双（ROUND_HALF_EVEN）量化到 6 位小数。
+校准指标（Brier 均分与分箱）全程使用 ``decimal.Decimal`` 计算，不经过
+浮点。注意 Decimal 的**算术运算受当前上下文精度约束**（默认 28 位有效
+数字）：高精度概率（如 50 位小数）的平方误差在默认上下文中会被提前
+舍入，可能越过最终 6 位量化的五成双分界而得到错误结果。因此
+:func:`build_calibration_report` 在一个按输入位数自适应的高精度局部
+上下文中完成单条平方误差、求和、跨事件均分与各分箱均值——任何中间
+值在最终 6 位量化之前都不发生上下文舍入（不可整除的均分也保留远超
+6 位所需的保护位）；:func:`quantize6` 同样在适配输入位数的局部上下文
+中完成五成双量化。概率解析与数值比较始终与上下文精度无关，模块也不
+修改全局 Decimal 上下文。对外数值统一四舍六入五成双（ROUND_HALF_EVEN）
+量化到 6 位小数。
 """
 
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from uuid import UUID
 
 # [0,1] 概率的严格语法：无空白、无符号、无指数；显式排除 Decimal 构造器
@@ -37,14 +46,48 @@ SIX_PLACES = Decimal("0.000001")
 ZERO = Decimal(0)
 ONE = Decimal(1)
 
+# 中间运算的精度下限：默认 Decimal 上下文精度（28 位有效数字）
+MIN_REPORT_PRECISION = 28
+# 高精度输入的额外保护位数：任何中间舍入误差都远小于 1e-7 的量化步长，
+# 使最终 6 位五成双量化与「先精确计算再量化」逐位一致
+GUARD_DIGITS = 24
+
+
+def _decimal_places(value: Decimal) -> int:
+    """有限 Decimal 的小数位数（``-exponent``，负数指数按 0 计）。"""
+    exponent = value.as_tuple().exponent
+    return -exponent if exponent < 0 else 0
+
+
+def _report_precision(probabilities: list[Decimal], count: int) -> int:
+    """按输入规模推导报告所需的中间运算精度（有效数字位数）。
+
+    概率落在 [0, 1] 且最多 m 位小数时：单条平方误差 (p-y)^2 最多 2m 位
+    小数，n 条之和最多 2m + ceil(log10(n)) 位有效数字；各均值再除以
+    至多 n 的整数。取 2m + n 的十进制位数 + GUARD_DIGITS 位（且不低于
+    MIN_REPORT_PRECISION），可保证求和与单条平方误差完全精确、不可整除
+    的均值也保留足够保护位，使最终 6 位量化结果与精确十进制计算一致。
+    """
+    max_places = max((_decimal_places(p) for p in probabilities), default=0)
+    return max(MIN_REPORT_PRECISION, 2 * max_places + len(str(count)) + GUARD_DIGITS)
+
+
 # 十个分箱的左边界（最后一个为 [0.9, 1]，右端点 1 归入第 10 箱）
 BIN_COUNT = 10
 BIN_LOWER_BOUNDS = [Decimal(i) / Decimal(10) for i in range(BIN_COUNT)]
 
 
 def quantize6(value: Decimal) -> Decimal:
-    """四舍六入五成双量化到 6 位小数（数值对外输出前的统一处理）。"""
-    return value.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN)
+    """四舍六入五成双量化到 6 位小数（数值对外输出前的统一处理）。
+
+    在适配输入位数的局部上下文中量化：即使 ``value`` 的有效数字远多于
+    当前 Decimal 上下文精度（如高精度局部上下文算出的中间值），也不会
+    先被上下文舍入再量化；全局上下文不受影响。
+    """
+    digits = len(value.as_tuple().digits)
+    with localcontext() as ctx:
+        ctx.prec = max(MIN_REPORT_PRECISION, digits + GUARD_DIGITS)
+        return value.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN)
 
 
 def parse_probability(text: str) -> tuple[Decimal | None, str | None]:
@@ -148,12 +191,17 @@ def build_calibration_report(
 
     - sources 输入顺序任意；输出中有效 / 无效条目均按
       (event_id, committed_at, commitment_id) 稳定排序（UUID 取 128 位
-      整数比较）；
+      整数比较），汇总结果与输入顺序无关；
     - 每条有效预测的平方误差 = (probability - outcome)^2，十进制精确计算；
     - Brier 均分 = 有效预测平方误差之和 / 有效预测数；无有效预测为 None；
     - 十个分箱固定返回（空样本均值与正例频率均为 None，count 为 0）。
+
+    全部算术（平方、求和、各均值）在按输入规模推导的高精度局部上下文中
+    完成（见 :func:`_report_precision`），任何中间值在最终 6 位量化之前
+    都不被默认上下文的 28 位精度提前舍入；解析与比较与上下文精度无关，
+    全局 Decimal 上下文保持不变。
     """
-    predictions: list[CalibrationPrediction] = []
+    parsed: list[tuple[CalibrationSource, Decimal]] = []
     invalid: list[CalibrationInvalid] = []
     for source in sources:
         probability, reason = parse_probability(source.original_text)
@@ -168,19 +216,67 @@ def build_calibration_report(
                 )
             )
             continue
-        outcome_decimal = Decimal(source.outcome)
-        squared_error = (probability - outcome_decimal) ** 2
-        predictions.append(
-            CalibrationPrediction(
-                event_id=source.event_id,
-                commitment_id=source.commitment_id,
-                committed_at=source.committed_at,
-                original_text=source.original_text,
-                probability=probability,
-                outcome=source.outcome,
-                squared_error=squared_error,
+        parsed.append((source, probability))
+
+    # 中间运算精度随输入自适应：高精度概率的平方误差、跨事件均分与各
+    # 分箱均值在最终量化前都保持足够精度（局部上下文，不影响全局设置）
+    precision = _report_precision([p for _, p in parsed], len(parsed))
+    with localcontext() as ctx:
+        ctx.prec = precision
+
+        predictions: list[CalibrationPrediction] = []
+        for source, probability in parsed:
+            outcome_decimal = Decimal(source.outcome)
+            squared_error = (probability - outcome_decimal) ** 2
+            predictions.append(
+                CalibrationPrediction(
+                    event_id=source.event_id,
+                    commitment_id=source.commitment_id,
+                    committed_at=source.committed_at,
+                    original_text=source.original_text,
+                    probability=probability,
+                    outcome=source.outcome,
+                    squared_error=squared_error,
+                )
             )
-        )
+
+        brier_mean: Decimal | None = None
+        if predictions:
+            total = sum((p.squared_error for p in predictions), ZERO)
+            brier_mean = total / Decimal(len(predictions))
+
+        # 固定 10 个分箱：第 0～8 箱为 [k/10, (k+1)/10)，第 9 箱为 [0.9, 1]
+        bin_sums: list[Decimal] = [ZERO] * BIN_COUNT
+        bin_positive: list[int] = [0] * BIN_COUNT
+        bin_counts: list[int] = [0] * BIN_COUNT
+        for p in predictions:
+            i = bin_index_for(p.probability)
+            bin_counts[i] += 1
+            bin_sums[i] += p.probability
+            if p.outcome == 1:
+                bin_positive[i] += 1
+
+        bins: list[CalibrationBin] = []
+        for i in range(BIN_COUNT):
+            lower = BIN_LOWER_BOUNDS[i]
+            upper = ONE if i == BIN_COUNT - 1 else BIN_LOWER_BOUNDS[i + 1]
+            count = bin_counts[i]
+            if count == 0:
+                mean: Decimal | None = None
+                positive_rate: Decimal | None = None
+            else:
+                mean = bin_sums[i] / Decimal(count)
+                positive_rate = Decimal(bin_positive[i]) / Decimal(count)
+            bins.append(
+                CalibrationBin(
+                    index=i,
+                    lower=lower,
+                    upper=upper,
+                    count=count,
+                    mean=mean,
+                    positive_rate=positive_rate,
+                )
+            )
 
     # 与其他报告一致：时间相同时按承诺 ID（UUID 128 位整数）决胜；
     # 跨事件再先按事件 ID 分组排序
@@ -188,44 +284,6 @@ def build_calibration_report(
         key=lambda p: (p.event_id.int, p.committed_at, p.commitment_id.int)
     )
     invalid.sort(key=lambda p: (p.event_id.int, p.committed_at, p.commitment_id.int))
-
-    brier_mean: Decimal | None = None
-    if predictions:
-        total = sum((p.squared_error for p in predictions), ZERO)
-        brier_mean = total / Decimal(len(predictions))
-
-    # 固定 10 个分箱：第 0～8 箱为 [k/10, (k+1)/10)，第 9 箱为 [0.9, 1]
-    bin_sums: list[Decimal] = [ZERO] * BIN_COUNT
-    bin_positive: list[int] = [0] * BIN_COUNT
-    bin_counts: list[int] = [0] * BIN_COUNT
-    for p in predictions:
-        i = bin_index_for(p.probability)
-        bin_counts[i] += 1
-        bin_sums[i] += p.probability
-        if p.outcome == 1:
-            bin_positive[i] += 1
-
-    bins: list[CalibrationBin] = []
-    for i in range(BIN_COUNT):
-        lower = BIN_LOWER_BOUNDS[i]
-        upper = ONE if i == BIN_COUNT - 1 else BIN_LOWER_BOUNDS[i + 1]
-        count = bin_counts[i]
-        if count == 0:
-            mean: Decimal | None = None
-            positive_rate: Decimal | None = None
-        else:
-            mean = bin_sums[i] / Decimal(count)
-            positive_rate = Decimal(bin_positive[i]) / Decimal(count)
-        bins.append(
-            CalibrationBin(
-                index=i,
-                lower=lower,
-                upper=upper,
-                count=count,
-                mean=mean,
-                positive_rate=positive_rate,
-            )
-        )
 
     return CalibrationReport(
         predictions=predictions,
