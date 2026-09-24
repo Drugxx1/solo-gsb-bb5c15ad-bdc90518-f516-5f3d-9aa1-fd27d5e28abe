@@ -15,7 +15,8 @@ SQLite 文件库 + 模拟时钟，覆盖：
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN, localcontext
+from fractions import Fraction
 
 _tmpdir = tempfile.mkdtemp(prefix="sealed_predictions_calibration_test_")
 os.environ["DATABASE_URL"] = f"sqlite:///{_tmpdir}/calibration.db"
@@ -514,15 +515,17 @@ def test_build_report_pure_decimal_exact():
     ]
     result = calibration.build_calibration_report(sources, unrevealed_count=4)
     assert result.unrevealed_count == 4
-    # (0.1-0)^2 + (0.1-1)^2 + (1-1)^2 = 0.01 + 0.81 + 0 = 0.82，均分 0.82/3
-    assert result.brier_mean == Decimal("0.82") / Decimal("3")
+    # (0.1-0)^2 + (0.1-1)^2 + (1-1)^2 = 0.01 + 0.81 + 0 = 0.82，均分 0.82/3；
+    # 均分以精确 Fraction 保存（非终止小数，不经过有限精度除法）
+    assert result.brier_mean == Fraction(Decimal("0.82")) / 3
     assert result.predictions[0].squared_error == Decimal("0.01")
     assert result.predictions[1].squared_error == Decimal("0.81")
     assert result.predictions[2].squared_error == Decimal("0")
     assert result.bins[1].count == 2
-    assert result.bins[1].mean == Decimal("0.1")
-    assert result.bins[1].positive_rate == Decimal("0.5")
+    assert result.bins[1].mean == Fraction(1, 10)
+    assert result.bins[1].positive_rate == Fraction(1, 2)
     assert result.bins[9].count == 1
+    assert result.bins[9].mean == Fraction(1, 1)
     # 排序：事件 1 的两条（按 commitment_id）在事件 2 之前
     assert [p.commitment_id for p in result.predictions] == [
         _uuid(101), _uuid(102), _uuid(201)
@@ -532,3 +535,199 @@ def test_build_report_pure_decimal_exact():
 def _uuid(suffix: int):
     import uuid
     return uuid.UUID(int=suffix)
+
+
+# --------------------------------------------------------------------------- #
+# 高精度：平方误差 / Brier 均分 / 分箱均值在 6 位量化前必须保持精确
+# --------------------------------------------------------------------------- #
+
+# 50 位概率：精确平方为 0.250000500000000000000000000000000000000000000005778…，
+# 6 位量化应为 0.250001；而 Decimal 默认 28 位上下文会把平方提前舍入为
+# 恰好 0.2500005，五成双量化误得 0.250000
+HIGH_P = "0.50000049999975000024999968750043749934375103124833"
+HIGH_P_2 = "0.50000049999980000000000000000000000000000000000001"
+
+
+def _high_precision_decimal(fn):
+    """独立预言：在 400 位 Decimal 上下文中执行 fn（输入至多 50 位，
+    平方至多 100 位，400 位下结果与精确十进制计算无法区分）。"""
+    with localcontext() as ctx:
+        ctx.prec = 400
+        return fn()
+
+
+def _exact_quant6(value: Decimal) -> str:
+    """独立预言的 6 位五成双量化字符串（value 已在高精度上下文中算得）。"""
+    return f"{value.quantize(Decimal('0.000001'), rounding=ROUND_HALF_EVEN):f}"
+
+
+def _source(event_suffix: int, commitment_suffix: int, text: str, outcome: int):
+    return calibration.CalibrationSource(
+        event_id=_uuid(event_suffix),
+        commitment_id=_uuid(commitment_suffix),
+        committed_at=T0,
+        original_text=text,
+        outcome=outcome,
+    )
+
+
+def test_exact_squared_error_pure():
+    p, reason = calibration.parse_probability(HIGH_P)
+    assert reason is None
+    se = calibration.exact_squared_error(p, 0)
+    # 独立对照：分数精确展开
+    assert Fraction(se) == Fraction(p) ** 2
+    assert f"{calibration.quantize6(se):f}" == "0.250001"
+    se1 = calibration.exact_squared_error(p, 1)
+    assert Fraction(se1) == (1 - Fraction(p)) ** 2
+
+    # 端点、尾随零与短输入均与朴素精确计算一致
+    for text, outcome, expected in [
+        ("0", 1, "1"), ("1", 1, "0"), ("0", 0, "0"),
+        ("0.00", 0, "0"), ("1.00", 1, "0"),
+        ("0.5", 0, "0.25"), ("0.5", 1, "0.25"),
+        (".25", 1, "0.5625"), ("1.", 0, "1"),
+    ]:
+        prob, _ = calibration.parse_probability(text)
+        assert calibration.exact_squared_error(prob, outcome) == Decimal(expected), text
+
+
+def test_high_precision_squared_error_api_regression():
+    # 默认 28 位上下文复现旧误差：朴素 **2 提前舍入 -> 0.250000
+    with localcontext() as ctx:
+        ctx.prec = 28
+        naive_rounded = (Decimal(HIGH_P) ** 2).quantize(
+            Decimal("0.000001"), rounding=ROUND_HALF_EVEN
+        )
+    assert f"{naive_rounded:f}" == "0.250000"
+    # 精确平方（400 位上下文独立预言）量化为 0.250001
+    exact_se = _high_precision_decimal(lambda: Decimal(HIGH_P) ** 2)
+    assert _exact_quant6(exact_se) == "0.250001"
+
+    event_id = settled_event([(HIGH_P, "high-precision")], "0")
+    body = report([event_id])
+    assert body["valid_prediction_count"] == 1
+    pred = body["predictions"][0]
+    assert pred["original_text"] == HIGH_P
+    assert pred["squared_error"] == "0.250001"
+    assert body["brier_mean"] == "0.250001"
+
+
+def test_high_precision_multiple_predictions_api_and_order_invariant():
+    # 两个事件、共 4 条结果为 0 的预测（其中两条 50 位高精度）；
+    # 跨事件均分与分箱均值都须与 400 位 Decimal 独立预言逐位一致
+    event_a = settled_event([(HIGH_P, "hp-a"), ("0.5", "plain-a")], "0")
+    event_b = settled_event([(HIGH_P_2, "hp-b"), ("0.75", "plain-b")], "0")
+    texts = [HIGH_P, "0.5", HIGH_P_2, "0.75"]
+
+    expected_se = {
+        text: _high_precision_decimal(lambda t=text: _exact_quant6(Decimal(t) ** 2))
+        for text in texts
+    }
+    expected_brier = _high_precision_decimal(
+        lambda: _exact_quant6(
+            sum((Decimal(t) ** 2 for t in texts), Decimal(0)) / len(texts)
+        )
+    )
+    # 第 5 箱 [0.5,0.6)：HIGH_P、HIGH_P_2、0.5 三条；均值的独立预言
+    bin5_texts = [HIGH_P, HIGH_P_2, "0.5"]
+    expected_bin5_mean = _high_precision_decimal(
+        lambda: _exact_quant6(
+            sum((Decimal(t) for t in bin5_texts), Decimal(0)) / len(bin5_texts)
+        )
+    )
+
+    body_ab = report([event_a, event_b])
+    body_ba = report([event_b, event_a])  # 请求事件顺序不改变汇总
+    # event_ids 按请求首次出现顺序回显，其余内容逐字节一致
+    assert body_ab["event_ids"] == [event_a, event_b]
+    assert body_ba["event_ids"] == [event_b, event_a]
+    assert {k: v for k, v in body_ab.items() if k != "event_ids"} == {
+        k: v for k, v in body_ba.items() if k != "event_ids"
+    }
+
+    assert body_ab["brier_mean"] == expected_brier
+    se_by_text = {p["original_text"]: p["squared_error"]
+                  for p in body_ab["predictions"]}
+    assert se_by_text == expected_se
+
+    bin5 = body_ab["bins"][5]
+    assert bin5["count"] == 3
+    assert bin5["mean"] == expected_bin5_mean
+    # 0.75 在第 7 箱
+    assert body_ab["bins"][7]["count"] == 1
+    assert body_ab["bins"][7]["mean"] == "0.750000"
+
+
+def test_build_report_high_precision_order_invariant_pure():
+    # 纯函数：同一批 sources 正序 / 逆序构建出的报告完全相等（排序确定、
+    # 有理数累加与顺序无关）
+    rows = [
+        (1, 101, HIGH_P, 0),
+        (1, 102, "0.5", 0),
+        (2, 201, HIGH_P_2, 0),
+        (2, 202, "0.75", 0),
+        (3, 301, "0.9", 1),
+    ]
+    sources = [_source(*row) for row in rows]
+    forward = calibration.build_calibration_report(sources, unrevealed_count=0)
+    reverse = calibration.build_calibration_report(list(reversed(sources)), 0)
+    assert forward == reverse
+
+    # 与精确有理数计算逐一对照（Fraction 平方为独立实现路径）
+    exact_ses = {
+        text: (Fraction(Decimal(text)) - outcome) ** 2
+        for _, _, text, outcome in rows
+    }
+    for p in forward.predictions:
+        assert Fraction(p.squared_error) == exact_ses[p.original_text]
+    assert forward.brier_mean == sum(exact_ses.values()) / len(rows)
+
+    # 第 5 箱均值 = (HIGH_P + HIGH_P_2 + 0.5) / 3；与 400 位独立预言一致
+    bin5 = forward.bins[5]
+    assert bin5.count == 3
+    bin5_exact = (
+        Fraction(Decimal(HIGH_P)) + Fraction(Decimal(HIGH_P_2)) + Fraction(1, 2)
+    ) / 3
+    assert bin5.mean == bin5_exact
+    expected_bin5 = _high_precision_decimal(
+        lambda: _exact_quant6(
+            (Decimal(HIGH_P) + Decimal(HIGH_P_2) + Decimal("0.5")) / 3
+        )
+    )
+    assert f"{calibration.quantize6(bin5.mean):f}" == expected_bin5
+
+
+def test_bin_mean_exact_half_tie_pure():
+    # 两数均值 = 0.5000005 + 5e-51：极其接近六成半边界但严格大于它，
+    # 必须向上取整为 0.500001；默认 28 位精度会把两数都塌缩为
+    # 0.5000005000000000000000000000（50 位末位丢失），均值恰为
+    # 0.250000... 五成双边界而误得 0.500000
+    a = "0.50000050000000000000000000000000000000000000000001"
+    b = "0.50000050000000000000000000000000000000000000000000"
+    assert len(a) == len(b) == 52  # "0." + 50 位小数
+    sources = [_source(1, 11, a, 1), _source(1, 12, b, 1)]
+    report_ = calibration.build_calibration_report(sources, 0)
+    bin5 = report_.bins[5]
+    assert bin5.count == 2
+    exact_mean = (Fraction(Decimal(a)) + Fraction(Decimal(b))) / 2
+    assert bin5.mean == exact_mean
+    assert f"{calibration.quantize6(bin5.mean):f}" == "0.500001"
+    # 精确恰在五成双边界 0.5000005 时仍向偶数 -> 0.500000
+    assert f"{calibration.quantize6(Fraction(5000005, 10**7)):f}" == "0.500000"
+
+
+def test_quantize6_fraction_half_even():
+    # Fraction 输入与 Decimal 输入共享同一套 6 位五成双语义
+    cases = {
+        Fraction(1, 2_000_000): "0.000000",   # 0.0000005 -> 偶数
+        Fraction(3, 2_000_000): "0.000002",   # 0.0000015 -> 向偶数
+        Fraction(5, 2_000_000): "0.000002",   # 0.0000025 -> 向偶数
+        Fraction(2, 3): "0.666667",
+        Fraction(1, 3): "0.333333",
+        Fraction(0): "0.000000",
+        Fraction(1): "1.000000",
+        Fraction(2500005000001, 10**13): "0.250001",  # 0.2500005000001
+    }
+    for value, expected in cases.items():
+        assert f"{calibration.quantize6(value):f}" == expected, value
